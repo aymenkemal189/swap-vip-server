@@ -10,73 +10,111 @@ const app = express();
 app.use(cors());
 app.use(express.json());
 
-// ⚙️ Environment Variables (በ Render ላይ የሚሞሉ)
-const BOT_TOKEN = process.env.BOT_TOKEN; 
-const ADMIN_GROUP_ID = process.env.ADMIN_GROUP_ID; // ምሳሌ: -100xxxxxxxxxx
-const SHEET_WEBHOOK_URL = process.env.SHEET_WEBHOOK_URL; // ከደረጃ 1 ያገኘኸው URL
+// ═══════════════════════════════════════════════════════════════════
+// ⚙️ CONFIGURATION & ENVIRONMENT VARIABLES
+// ═══════════════════════════════════════════════════════════════════
+const BOT_TOKEN         = process.env.BOT_TOKEN;
+const ADMIN_GROUP_ID    = process.env.ADMIN_GROUP_ID;
+
+// 1. አዲሱ የ VIP ፋይናንስ መከታተያ Sheet Webhook URL
+const VIP_SHEET_URL     = process.env.SHEET_WEBHOOK_URL || process.env.VIP_SHEET_URL;
+
+// 2. ዋናው የ Swap Money Apps Script URL (ዋሌት እና User ደረጃዎችን የያዘው)
+const MAIN_SCRIPT_URL   = process.env.MAIN_SCRIPT_URL || 'https://script.google.com/macros/s/AKfycbxDii62Bjz7KNxIFY9deeDDxnjNx1ifHu93GRxkhmpC9srZ_ZFSAtQgttQYh8o1pXmIgQ/exec';
+
+// ዋናው Apps Script ውስጥ ያለህ ሚስጥራዊ ቁልፍ
+const ADMIN_SECRET      = process.env.ADMIN_SECRET || 'SWAP_ADMIN_SECURE_2026';
 
 const bot = new TelegramBot(BOT_TOKEN, { polling: true });
 const upload = multer({ dest: 'uploads/' });
 
-// ፈጣን Cache (ተጠቃሚው አፕ ላይ ሲጠይቅ በ 5ms እንዲመልስለት)
+// ፈጣን Cache (ተጠቃሚው አፕ ላይ ሲጠይቅ ከ Sheet መልስ ሳይጠብቅ በ 0.01 ሰከንድ እንዲመልስለት)
 const liveStatusCache = {};
 
-// Helper: ከ Google Sheet ጋር መገናኛ
-async function callSheet(payload) {
-  if (!SHEET_WEBHOOK_URL) return null;
+// ═══════════════════════════════════════════════════════════════════
+// 🌉 DUAL SHEET API CALL HELPERS
+// ═══════════════════════════════════════════════════════════════════
+
+// ሀ. ከአዲሱ VIP Sheet ጋር መገናኛ
+async function callVipSheet(payload) {
+  if (!VIP_SHEET_URL) return null;
   try {
-    const res = await fetch(SHEET_WEBHOOK_URL, {
+    const res = await fetch(VIP_SHEET_URL, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(payload)
     });
     return await res.json();
   } catch (e) {
-    console.error('Sheet API Error:', e.message);
+    console.error('❌ VIP Sheet Call Error:', e.message);
     return null;
   }
 }
 
-// -------------------------------------------------------------
-// 1. ከአፑ የክፍያ ጥያቄ ሲላክ (ፎቶ + SMS)
-// -------------------------------------------------------------
+// ለ. ከዋናው Swap Money Apps Script ጋር መገናኛ
+async function callMainSheet(payload) {
+  if (!MAIN_SCRIPT_URL) return null;
+  try {
+    const res = await fetch(MAIN_SCRIPT_URL, {
+      method: 'POST',
+      headers: { 'Content-Type': 'text/plain;charset=utf-8' },
+      body: JSON.stringify(payload)
+    });
+    return await res.json();
+  } catch (e) {
+    console.error('❌ Main Sheet Call Error:', e.message);
+    return null;
+  }
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// 1. ተጠቃሚው በአፑ ላይ ክፍያ ሲልክ (SUBMIT VIP PAYMENT)
+// ═══════════════════════════════════════════════════════════════════
 app.post('/api/submit-vip-payment', upload.single('receiptPhoto'), async (req, res) => {
   try {
     const { userId, username, vipTier, amount, txId, fullSms, method } = req.body;
     const file = req.file;
 
-    // Cache ላይ Pending አድርገን እንይዛለን
-    liveStatusCache[userId] = { status: 'pending', tier: vipTier };
+    const tierName = String(vipTier || 'VIP').toUpperCase();
+    const cleanMethod = String(method || 'Telebirr');
 
-    // 1. Google Sheet ላይ "PENDING" ብሎ መመዝገብ
-    callSheet({
+    // Cache ላይ Pending አድርገን እንይዛለን
+    liveStatusCache[userId] = { 
+      status: 'pending', 
+      tier: tierName, 
+      amount: amount, 
+      txId: txId 
+    };
+
+    // 1. አዲሱ VIP Sheet ላይ "PENDING" ብሎ መመዝገብ (ለፋይናንስ ኦዲት)
+    callVipSheet({
       action: 'record_pending',
       userId: userId,
-      username: username,
-      tier: vipTier,
+      username: username || 'User',
+      tier: tierName,
       amount: amount,
-      method: method || 'Telebirr',
-      txId: txId
+      method: cleanMethod,
+      txId: txId || 'N/A'
     });
 
-    // 2. ወደ ቴሌግራም አድሚን ግሩፕ መልዕክት መላክ
+    // 2. ወደ ቴሌግራም አድሚን ግሩፕ ማራኪ መልዕክት ከነቁልፎቹ መላክ
     const caption = 
-      `💎 <b>አዲስ የ VIP ክፍያ ጥያቄ ደርሷል!</b>\n` +
+      `💎 <b>አዲስ የ ${tierName} ክፍያ ጥያቄ ደርሷል!</b>\n` +
       `━━━━━━━━━━━━━━━━━━━━\n` +
       `👤 <b>ተጠቃሚ:</b> @${username || 'N/A'} (ID: <code>${userId}</code>)\n` +
-      `📦 <b>የተመረጠ ጥቅል:</b> <b>${vipTier}</b> (${amount} ETB)\n` +
-      `🏦 <b>የክፍያ መንገድ:</b> ${method || 'Telebirr'}\n` +
+      `📦 <b>ጥቅል:</b> <b>${tierName}</b> (${amount} ETB)\n` +
+      `🏦 <b>የክፍያ መንገድ:</b> ${cleanMethod}\n` +
       `🧾 <b>TxID:</b> <code>${txId || 'ያልተገኘ'}</code>\n` +
       `━━━━━━━━━━━━━━━━━━━━\n` +
-      `📱 <b>የ SMS መልዕክት:</b>\n<i>${fullSms ? fullSms.slice(0, 150) + '...' : 'የደረሰኝ ፎቶ ብቻ ተልኳል'}</i>\n\n` +
-      `👇 <i>እባክዎ ደረሰኙን አረጋግጠው አንዱን ይምረጡ፦</i>`;
+      `📱 <b>የ SMS መልዕክት:</b>\n<i>${fullSms ? fullSms.slice(0, 160) + '...' : 'የደረሰኝ ፎቶ ብቻ ተያይዟል'}</i>\n\n` +
+      `👇 <i>ክፍያውን ካረጋገጡ በኋላ አንዱን ይምረጡ፦</i>`;
 
     const inlineKeyboard = {
       reply_markup: {
         inline_keyboard: [
           [
-            { text: `✅ Approve (${amount} ETB)`, callback_data: `v_app:${userId}:${vipTier}:${amount}` },
-            { text: `❌ Reject`, callback_data: `v_rej:${userId}` }
+            { text: `✅ Approve (${amount} ETB)`, callback_data: `v_app:${userId}:${tierName}:${amount}:${txId || ''}` },
+            { text: `❌ Reject`, callback_data: `v_rej:${userId}:${txId || ''}` }
           ]
         ]
       },
@@ -88,12 +126,15 @@ app.post('/api/submit-vip-payment', upload.single('receiptPhoto'), async (req, r
         caption: caption,
         ...inlineKeyboard
       });
-      fs.unlinkSync(file.path);
+      fs.unlinkSync(file.path); // ጊዜያዊ ፋይል ማጽዳት
     } else {
       await bot.sendMessage(ADMIN_GROUP_ID, caption, inlineKeyboard);
     }
 
-    res.json({ status: 'success', message: 'ክፍያዎ ወደ አድሚን ግሩፕ ተልኳል!' });
+    res.json({ 
+      status: 'success', 
+      message: 'ክፍያዎ ወደ አድሚን ግሩፕ ተልኳል! በደቂቃዎች ውስጥ ይረጋገጣል።' 
+    });
 
   } catch (error) {
     console.error('Submit Error:', error);
@@ -101,36 +142,47 @@ app.post('/api/submit-vip-payment', upload.single('receiptPhoto'), async (req, r
   }
 });
 
-// -------------------------------------------------------------
-// 2. አድሚኑ በቴሌግራም ግሩፑ ላይ ሲጫን (Approve / Reject)
-// -------------------------------------------------------------
+// ═══════════════════════════════════════════════════════════════════
+// 2. አድሚን በቴሌግራም ግሩፑ ላይ [APPROVE] ወይም [REJECT] ሲነካ
+// ═══════════════════════════════════════════════════════════════════
 bot.on('callback_query', async (query) => {
   const data = query.data;
   const adminTag = query.from.username ? `@${query.from.username}` : (query.from.first_name || 'Admin');
 
-  // APPROVE ሲጫን
+  // ─────────────────────────────────────────────────────────────
+  // ✅ አድሚኑ APPROVE ሲጫን (ሁለቱንም ሺቶች በአንድ ጊዜ ማዘመን)
+  // ─────────────────────────────────────────────────────────────
   if (data.startsWith('v_app:')) {
-    const [_, userId, tier, amount] = data.split(':');
+    const [_, userId, tier, amount, txId] = data.split(':');
 
     const expiryDate = new Date();
     expiryDate.setDate(expiryDate.getDate() + 30);
     const expiryStr = expiryDate.toISOString().split('T')[0];
 
-    // Cache ማዘመን (አፑ ወዲያው እንዲያውቀው)
+    // 1. ለተጠቃሚው አፕ ወዲያውኑ የሚታይበትን Cache ማዘመን
     liveStatusCache[userId] = {
       status: 'approved',
       tier: tier.toUpperCase(),
       expiry: expiryStr
     };
 
-    // Google Sheet ማዘመን
-    callSheet({
+    // 2. ወደ አዲሱ VIP Sheet መላክ ➔ Status = "APPROVED" ይሆናል (የገንዘብ ኦዲት)
+    callVipSheet({
       action: 'approve_vip',
       userId: userId,
       approvedBy: adminTag
     });
 
-    // የግሩፑን መልዕክት ማዘመን
+    // 3. ወደ ዋናው Swap Money Sheet መላክ ➔ Users ሺት ላይ አምድ 9 = tier፣ አምድ 10 = ExpiryDate ይሆናል!
+    callMainSheet({
+      action: 'approvevip',
+      adminKey: ADMIN_SECRET,
+      userId: userId,
+      vipTier: tier.toUpperCase(),
+      txId: txId || ''
+    });
+
+    // 4. በቴሌግራም ግሩፑ ላይ የነበሩትን አዝራሮች በማንሳት "ጸድቋል" ብሎ ማዘመን
     const originalText = query.message.caption || query.message.text || '';
     const updatedCaption = originalText + `\n\n✅ <b>በ ${adminTag} ጸድቋል! (APPROVED)</b>`;
 
@@ -148,11 +200,13 @@ bot.on('callback_query', async (query) => {
       });
     }
 
-    // ለተጠቃሚው በቦቱ የግል ማሳወቂያ መላክ
+    // 5. ለተጠቃሚው በቦቱ የግል መልዕክት ማሳወቅ
     try {
       await bot.sendMessage(userId, 
-        `🎉 <b>እንኳን ደስ አለዎት!</b>\n` +
-        `የ <b>${tier} አባልነትዎ</b> በአድሚን ጸድቋል! አሁኑኑ አፑን ከፍተው በልዩ ጥቅማጥቅሞች ይደሰቱ!`, 
+        `🎉 <b>እንኳን ደስ አለዎት!</b>\n\n` +
+        `የ <b>${tier} አባልነትዎ</b> በተሳካ ሁኔታ ጸድቋል!\n` +
+        `🌟 አሁኑኑ አፑን ከፍተው በልዩ ጥቅማጥቅሞች (ከፍተኛ የማስታወቂያ ክፍያና ፈጣን ማውጫ) ይደሰቱ!\n` +
+        `📅 የሚያበቃበት ቀን: <b>${expiryStr}</b>`, 
         { parse_mode: 'HTML' }
       );
     } catch (e) {}
@@ -160,15 +214,27 @@ bot.on('callback_query', async (query) => {
     bot.answerCallbackQuery(query.id, { text: `✅ ${tier} በተሳካ ሁኔታ ጸድቋል!` });
   }
 
-  // REJECT ሲጫን
+  // ─────────────────────────────────────────────────────────────
+  // ❌ አድሚኑ REJECT ሲጫን
+  // ─────────────────────────────────────────────────────────────
   else if (data.startsWith('v_rej:')) {
-    const [_, userId] = data.split(':');
+    const [_, userId, txId] = data.split(':');
+
     liveStatusCache[userId] = { status: 'rejected' };
 
-    callSheet({
+    // 1. VIP Sheet ላይ ውድቅ ማድረግ
+    callVipSheet({
       action: 'reject_vip',
       userId: userId,
       rejectedBy: adminTag
+    });
+
+    // 2. ዋናው Sheet ላይ ውድቅ ማድረግ
+    callMainSheet({
+      action: 'rejectvip',
+      adminKey: ADMIN_SECRET,
+      userId: userId,
+      reason: 'የላኩት ደረሰኝ ወይም TxID ትክክል አይደለም'
     });
 
     const originalText = query.message.caption || query.message.text || '';
@@ -189,16 +255,20 @@ bot.on('callback_query', async (query) => {
     }
 
     try {
-      await bot.sendMessage(userId, `⚠️ <b>ማሳሰቢያ፦</b> ያስገቡት የክፍያ ደረሰኝ ትክክል ስላልሆነ በአድሚን ውድቅ ተደርጓል።`, { parse_mode: 'HTML' });
+      await bot.sendMessage(userId, 
+        `⚠️ <b>የክፍያ ማሳሰቢያ፦</b>\n` +
+        `ያስገቡት የክፍያ ደረሰኝ ወይም TxID ትክክል ስላልሆነ በአድሚን ውድቅ ተደርጓል። እባክዎ ትክክለኛውን ደረሰኝ ይላኩ።`, 
+        { parse_mode: 'HTML' }
+      );
     } catch (e) {}
 
-    bot.answerCallbackQuery(query.id, { text: `❌ ውድቅ ተደርጓል!` });
+    bot.answerCallbackQuery(query.id, { text: `❌ ክፍያው ውድቅ ተደርጓል!` });
   }
 });
 
-// -------------------------------------------------------------
-// 3. አፑ በጀርባ እየጠየቀ የሚያጣራበት (Status Poller)
-// -------------------------------------------------------------
+// ═══════════════════════════════════════════════════════════════════
+// 3. አፑ በየ 3 ሰከንዱ ሁኔታውን የሚጠይቅበት (POLLING ENDPOINT)
+// ═══════════════════════════════════════════════════════════════════
 app.get('/api/check-vip-status', (req, res) => {
   const userId = req.query.userId;
   const user = liveStatusCache[userId];
@@ -209,17 +279,17 @@ app.get('/api/check-vip-status', (req, res) => {
   }
 });
 
-// -------------------------------------------------------------
-// 4. አድሚን ግሩፕ ውስጥ የሚሰራ /stats ወይም /dashboard Command
-// -------------------------------------------------------------
+// ═══════════════════════════════════════════════════════════════════
+// 4. በቴሌግራም አድሚን ግሩፕ ውስጥ የሚሰራ የፋይናንስ ሪፖርት (/stats)
+// ═══════════════════════════════════════════════════════════════════
 bot.onText(/\/stats|\/dashboard/, async (msg) => {
   if (String(msg.chat.id) !== String(ADMIN_GROUP_ID)) return;
 
   const waitMsg = await bot.sendMessage(msg.chat.id, '⏳ ከ Google Sheet መረጃዎችን በማስላት ላይ...');
-  const stats = await callSheet({ action: 'get_stats' });
+  const stats = await callVipSheet({ action: 'get_stats' });
 
   if (!stats || stats.status !== 'success') {
-    return bot.editMessageText('❌ መረጃዎችን ከ Sheet ማምጣት አልተቻለም።', {
+    return bot.editMessageText('❌ መረጃዎችን ከ VIP Sheet ማምጣት አልተቻለም።', {
       chat_id: msg.chat.id,
       message_id: waitMsg.message_id
     });
@@ -236,7 +306,7 @@ bot.onText(/\/stats|\/dashboard/, async (msg) => {
     `⏳ <b>በጥበቃ ላይ ያሉ፦</b> ${stats.pendingCount} ጥያቄዎች\n` +
     `❌ <b>ውድቅ የተደረጉ፦</b> ${stats.rejectedCount} ጥያቄዎች\n` +
     `━━━━━━━━━━━━━━━━━━━━\n` +
-    `⚡ <i>መረጃው በቀጥታ ከኦፊሴላዊው Google Sheet የተወሰደ ነው።</i>`;
+    `⚡ <i>መረጃው በቀጥታ ከኦፊሴላዊው የ VIP Sheet የተወሰደ ነው።</i>`;
 
   bot.editMessageText(report, {
     chat_id: msg.chat.id,
@@ -246,4 +316,4 @@ bot.onText(/\/stats|\/dashboard/, async (msg) => {
 });
 
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`🚀 VIP Server live on port ${PORT}`));
+app.listen(PORT, () => console.log(`🚀 Dual Sheet VIP Bridge Server running on port ${PORT}`));
