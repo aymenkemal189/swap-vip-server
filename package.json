@@ -1,7 +1,7 @@
 {
-  "name": "swap-vip-approval-server",
-  "version": "1.0.0",
-  "description": "Swap Money VIP Payment Approval & Telegram Bot Engine",
+  "name": "swap-vip-dual-bridge-server",
+  "version": "4.0.0",
+  "description": "Dual Sheet Bridge & Telegram Approval Server for Swap Money V4",
   "main": "server.js",
   "scripts": {
     "start": "node server.js"
