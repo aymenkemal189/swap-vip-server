@@ -1,404 +1,249 @@
-/**
- * ═══════════════════════════════════════════════════════════════════
- * SWAP MONEY V4 — TELEGRAM-NATIVE VIP & PAYMENT SERVER
- * Direct Photo Uploads • Telegram Inline [Approve/Reject] Buttons
- * Real-time Webhook Auto-Approval • Zero-Delay Dashboard API
- * ═══════════════════════════════════════════════════════════════════
- */
-
+require('dotenv').config();
 const express = require('express');
 const cors = require('cors');
-const fs = require('fs');
-const path = require('path');
-const axios = require('axios');
 const multer = require('multer');
-const FormData = require('form-data');
+const TelegramBot = require('node-telegram-bot-api');
+const fetch = require('node-fetch');
+const fs = require('fs');
 
 const app = express();
-const PORT = process.env.PORT || 3000;
-
-// Configurations
-const BOT_TOKEN = process.env.BOT_TOKEN || '8925694023:AAHA0DvvHAYLkXNprRaQ6eKC99AwqeX8Kbc';
-const ADMIN_CHAT_ID = process.env.ADMIN_CHAT_ID || '5884065141';
-const ADMIN_SECRET = process.env.ADMIN_SECRET || 'SWAP_ADMIN_SECURE_2026';
-
-// 🛡️ Middleware
-app.use(cors()); // CORS ችግርን ሙሉ በሙሉ ያስቀረዋል
+app.use(cors());
 app.use(express.json());
 
-// 📸 ፎቶዎችን በ Memory ውስጥ በፍጥነት ማስተናገጃ
-const upload = multer({
-  storage: multer.memoryStorage(),
-  limits: { fileSize: 12 * 1024 * 1024 } // እስከ 12MB ፎቶ ይቀበላል
-});
+// ⚙️ Environment Variables (በ Render ላይ የሚሞሉ)
+const BOT_TOKEN = process.env.BOT_TOKEN; 
+const ADMIN_GROUP_ID = process.env.ADMIN_GROUP_ID; // ምሳሌ: -100xxxxxxxxxx
+const SHEET_WEBHOOK_URL = process.env.SHEET_WEBHOOK_URL; // ከደረጃ 1 ያገኘኸው URL
 
-// JSON ዳታቤዝ ፋይል ማዘጋጃ
-const DB_FILE = path.join(__dirname, 'subscriptions.json');
+const bot = new TelegramBot(BOT_TOKEN, { polling: true });
+const upload = multer({ dest: 'uploads/' });
 
-function loadDB() {
+// ፈጣን Cache (ተጠቃሚው አፕ ላይ ሲጠይቅ በ 5ms እንዲመልስለት)
+const liveStatusCache = {};
+
+// Helper: ከ Google Sheet ጋር መገናኛ
+async function callSheet(payload) {
+  if (!SHEET_WEBHOOK_URL) return null;
   try {
-    if (!fs.existsSync(DB_FILE)) {
-      fs.writeFileSync(DB_FILE, JSON.stringify({ subscriptions: [], usersVip: {} }, null, 2));
-    }
-    const raw = fs.readFileSync(DB_FILE, 'utf-8');
-    return JSON.parse(raw);
+    const res = await fetch(SHEET_WEBHOOK_URL, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload)
+    });
+    return await res.json();
   } catch (e) {
-    return { subscriptions: [], usersVip: {} };
+    console.error('Sheet API Error:', e.message);
+    return null;
   }
 }
 
-function saveDB(data) {
-  try {
-    fs.writeFileSync(DB_FILE, JSON.stringify(data, null, 2));
-  } catch (e) {
-    console.error('Failed to save DB:', e);
-  }
-}
-
-// 🛡️ ቴሌግራም መልዕክት እንዳይዘጋ ምልክቶችን ማጣሪያ
-function escapeTg(text) {
-  if (!text) return '';
-  return String(text).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
-}
-
-// ═══════════════════════════════════════════════════════════════════
-// API ROUTES
-// ═══════════════════════════════════════════════════════════════════
-
-// Health Check
-app.get('/', (req, res) => {
-  res.json({ status: 'online', service: 'Swap Money VIP Telegram Server V4' });
-});
-
-// 💎 1. ተጠቃሚው ክፍያ ሲልክ (ፎቶ እና SMS በአንድ ላይ ይቀበላል)
-app.post('/api/submit-payment', upload.single('screenshot'), async (req, res) => {
+// -------------------------------------------------------------
+// 1. ከአፑ የክፍያ ጥያቄ ሲላክ (ፎቶ + SMS)
+// -------------------------------------------------------------
+app.post('/api/submit-vip-payment', upload.single('receiptPhoto'), async (req, res) => {
   try {
     const { userId, username, vipTier, amount, txId, fullSms, method } = req.body;
+    const file = req.file;
 
-    if (!userId || !txId) {
-      return res.status(400).json({ status: 'error', message: 'User ID እና TxID ያስፈልጋል!' });
-    }
+    // Cache ላይ Pending አድርገን እንይዛለን
+    liveStatusCache[userId] = { status: 'pending', tier: vipTier };
 
-    const db = loadDB();
+    // 1. Google Sheet ላይ "PENDING" ብሎ መመዝገብ
+    callSheet({
+      action: 'record_pending',
+      userId: userId,
+      username: username,
+      tier: vipTier,
+      amount: amount,
+      method: method || 'Telebirr',
+      txId: txId
+    });
 
-    // የተደጋገመ TxID ማጣራት (Replay Attack Protection)
-    const exists = db.subscriptions.find(s => String(s.txId).trim().toLowerCase() === String(txId).trim().toLowerCase());
-    if (exists) {
-      return res.status(400).json({ status: 'error', message: 'ይህ የትራንዛክሽን ቁጥር (TxID) አስቀድሞ ተመዝግቧል!' });
-    }
+    // 2. ወደ ቴሌግራም አድሚን ግሩፕ መልዕክት መላክ
+    const caption = 
+      `💎 <b>አዲስ የ VIP ክፍያ ጥያቄ ደርሷል!</b>\n` +
+      `━━━━━━━━━━━━━━━━━━━━\n` +
+      `👤 <b>ተጠቃሚ:</b> @${username || 'N/A'} (ID: <code>${userId}</code>)\n` +
+      `📦 <b>የተመረጠ ጥቅል:</b> <b>${vipTier}</b> (${amount} ETB)\n` +
+      `🏦 <b>የክፍያ መንገድ:</b> ${method || 'Telebirr'}\n` +
+      `🧾 <b>TxID:</b> <code>${txId || 'ያልተገኘ'}</code>\n` +
+      `━━━━━━━━━━━━━━━━━━━━\n` +
+      `📱 <b>የ SMS መልዕክት:</b>\n<i>${fullSms ? fullSms.slice(0, 150) + '...' : 'የደረሰኝ ፎቶ ብቻ ተልኳል'}</i>\n\n` +
+      `👇 <i>እባክዎ ደረሰኙን አረጋግጠው አንዱን ይምረጡ፦</i>`;
 
-    const orderId = 'ORD_' + Date.now();
-    const newOrder = {
-      id: orderId,
-      date: new Date().toISOString(),
-      userId: String(userId),
-      username: username || 'User',
-      vipTier: (vipTier || 'PRO').toUpperCase(),
-      amount: Number(amount) || 0,
-      txId: String(txId).trim(),
-      fullSms: fullSms || '',
-      method: method || 'Telebirr/CBE',
-      status: 'Pending',
-      expiryDate: '',
-      hasPhoto: !!req.file
-    };
-
-    db.subscriptions.unshift(newOrder);
-    saveDB(db);
-
-    // 📱 ወደ ቴሌግራም ግሩፕ/አካውንት የሚላክ የመልዕክት ዝግጅት
-    const cleanSms = escapeTg(fullSms ? fullSms.substring(0, 160) + (fullSms.length > 160 ? '...' : '') : '');
-    const captionText = `💎 <b>አዲስ የክፍያ ጥያቄ ደርሷል!</b>\n\n` +
-      `👤 <b>ተጠቃሚ:</b> @${escapeTg(username)} (<code>${userId}</code>)\n` +
-      `📦 <b>ጥቅል:</b> <b>${escapeTg(newOrder.vipTier)}</b>\n` +
-      `💰 <b>የተከፈለ መጠን:</b> <b>${newOrder.amount} ETB</b>\n` +
-      `🧾 <b>TxID:</b> <code>${escapeTg(newOrder.txId)}</code>\n` +
-      `🏦 <b>መንገድ:</b> ${escapeTg(newOrder.method)}\n` +
-      (cleanSms ? `📩 <b>SMS:</b> <i>${cleanSms}</i>\n` : '') +
-      `⏳ <b>ሁኔታ:</b> በጥበቃ ላይ (Pending)\n\n` +
-      `👇 <i>ከስር ባሉት አዝራሮች በቀጥታ ማጽደቅ ይችላሉ፦</i>`;
-
-    // 🔘 በቴሌግራም ውስጥ በቀጥታ የሚጫኑ አዝራሮች (Inline Keyboard)
-    const replyMarkup = {
-      inline_keyboard: [
-        [
-          { text: `✅ Approve (${newOrder.amount} ETB)`, callback_data: `appr_${orderId}` },
-          { text: '❌ Reject', callback_data: `rej_${orderId}` }
+    const inlineKeyboard = {
+      reply_markup: {
+        inline_keyboard: [
+          [
+            { text: `✅ Approve (${amount} ETB)`, callback_data: `v_app:${userId}:${vipTier}:${amount}` },
+            { text: `❌ Reject`, callback_data: `v_rej:${userId}` }
+          ]
         ]
-      ]
+      },
+      parse_mode: 'HTML'
     };
 
-    // ፎቶ ካለው ፎቶውን ከነ አዝራሩ ይልካል፤ ካልሆነ ጽሁፉን ከነ አዝራሩ ይልካል
-    if (req.file) {
-      const form = new FormData();
-      form.append('chat_id', ADMIN_CHAT_ID);
-      form.append('photo', req.file.buffer, { filename: 'screenshot.jpg' });
-      form.append('caption', captionText);
-      form.append('parse_mode', 'HTML');
-      form.append('reply_markup', JSON.stringify(replyMarkup));
-
-      await axios.post(`https://api.telegram.org/bot${BOT_TOKEN}/sendPhoto`, form, {
-        headers: form.getHeaders()
-      }).catch(e => console.error('Telegram Photo Error:', e.response?.data || e.message));
+    if (file) {
+      await bot.sendPhoto(ADMIN_GROUP_ID, fs.createReadStream(file.path), {
+        caption: caption,
+        ...inlineKeyboard
+      });
+      fs.unlinkSync(file.path);
     } else {
-      await axios.post(`https://api.telegram.org/bot${BOT_TOKEN}/sendMessage`, {
-        chat_id: ADMIN_CHAT_ID,
-        text: captionText,
-        parse_mode: 'HTML',
-        disable_web_page_preview: true,
-        reply_markup: replyMarkup
-      }).catch(e => console.error('Telegram Msg Error:', e.response?.data || e.message));
+      await bot.sendMessage(ADMIN_GROUP_ID, caption, inlineKeyboard);
     }
 
-    res.json({
-      status: 'success',
-      message: 'የክፍያ ጥያቄዎ በተሳካ ሁኔታ ተልኳል! በቅርቡ ተረጋግጦ ይከፈትልዎታል',
-      order: newOrder
+    res.json({ status: 'success', message: 'ክፍያዎ ወደ አድሚን ግሩፕ ተልኳል!' });
+
+  } catch (error) {
+    console.error('Submit Error:', error);
+    res.status(500).json({ status: 'error', message: 'ክፍያውን ማድረስ አልተቻለም' });
+  }
+});
+
+// -------------------------------------------------------------
+// 2. አድሚኑ በቴሌግራም ግሩፑ ላይ ሲጫን (Approve / Reject)
+// -------------------------------------------------------------
+bot.on('callback_query', async (query) => {
+  const data = query.data;
+  const adminTag = query.from.username ? `@${query.from.username}` : (query.from.first_name || 'Admin');
+
+  // APPROVE ሲጫን
+  if (data.startsWith('v_app:')) {
+    const [_, userId, tier, amount] = data.split(':');
+
+    const expiryDate = new Date();
+    expiryDate.setDate(expiryDate.getDate() + 30);
+    const expiryStr = expiryDate.toISOString().split('T')[0];
+
+    // Cache ማዘመን (አፑ ወዲያው እንዲያውቀው)
+    liveStatusCache[userId] = {
+      status: 'approved',
+      tier: tier.toUpperCase(),
+      expiry: expiryStr
+    };
+
+    // Google Sheet ማዘመን
+    callSheet({
+      action: 'approve_vip',
+      userId: userId,
+      approvedBy: adminTag
     });
-  } catch (err) {
-    res.status(500).json({ status: 'error', message: err.message });
-  }
-});
 
-// ⚡ 2. ቴሌግራም ላይ አድሚኑ [Approve] ወይም [Reject] ሲጫን ወዲያውኑ የሚፈጽም (WEBHOOK)
-app.post('/api/telegram-webhook', async (req, res) => {
-  try {
-    const update = req.body;
+    // የግሩፑን መልዕክት ማዘመን
+    const originalText = query.message.caption || query.message.text || '';
+    const updatedCaption = originalText + `\n\n✅ <b>በ ${adminTag} ጸድቋል! (APPROVED)</b>`;
 
-    if (update && update.callback_query) {
-      const query = update.callback_query;
-      const data = query.data || '';
-      const message = query.message;
-      const callbackQueryId = query.id;
-
-      const db = loadDB();
-
-      // አድሚኑ Approve ሲል
-      if (data.startsWith('appr_')) {
-        const orderId = data.replace('appr_', '');
-        const order = db.subscriptions.find(s => s.id === orderId);
-
-        if (order) {
-          const tier = order.vipTier || 'PRO';
-          const expiry = (tier === 'REFERRAL_BOOSTER')
-            ? new Date(Date.now() + 3650 * 24 * 60 * 60 * 1000).toISOString()
-            : new Date(Date.now() + 30 * 24 * 60 * 60 * 1000).toISOString();
-
-          order.status = 'Approved';
-          order.expiryDate = expiry;
-
-          // ተጠቃሚውን VIP ማድረግ
-          db.usersVip[order.userId] = {
-            vipTier: tier,
-            vipExpiry: expiry,
-            approvedAt: new Date().toISOString()
-          };
-          saveDB(db);
-
-          // 1. ለተጠቃሚው በቦቱ የማብሰሪያ መልዕክት መላክ
-          const userMsg = `🎉 <b>እንኳን ደስ አለዎት!</b>\n\n` +
-            `የ <b>${tier}</b> አባልነትዎ በአድሚን ጸድቋል!\n` +
-            `🌟 አሁን አፑን በመክፈት የልዩ ጥቅማጥቅምዎ ተጠቃሚ ይሁኑ።\n` +
-            `📅 የሚያበቃበት ቀን: ${new Date(expiry).toLocaleDateString()}`;
-
-          await axios.post(`https://api.telegram.org/bot${BOT_TOKEN}/sendMessage`, {
-            chat_id: order.userId,
-            text: userMsg,
-            parse_mode: 'HTML'
-          }).catch(() => {});
-
-          // 2. በቴሌግራም ግሩፑ ላይ የመጣውን መልዕክት ወደ "APPROVED" መቀየር
-          const updatedCaption = `✅ <b>ክፍያው ጸድቋል (APPROVED)!</b>\n\n` +
-            `👤 <b>ተጠቃሚ:</b> @${escapeTg(order.username)} (<code>${order.userId}</code>)\n` +
-            `💎 <b>ጥቅል:</b> ${order.vipTier}\n` +
-            `💰 <b>መጠን:</b> ${order.amount} ETB\n` +
-            `🧾 <b>TxID:</b> <code>${order.txId}</code>\n` +
-            `📅 <b>የሚያበቃበት:</b> ${new Date(expiry).toLocaleDateString()}\n` +
-            `✔️ <i>በአድሚን @Agent1hulubet ጸድቋል።</i>`;
-
-          if (message.photo) {
-            await axios.post(`https://api.telegram.org/bot${BOT_TOKEN}/editMessageCaption`, {
-              chat_id: message.chat.id,
-              message_id: message.message_id,
-              caption: updatedCaption,
-              parse_mode: 'HTML'
-            }).catch(() => {});
-          } else {
-            await axios.post(`https://api.telegram.org/bot${BOT_TOKEN}/editMessageText`, {
-              chat_id: message.chat.id,
-              message_id: message.message_id,
-              text: updatedCaption,
-              parse_mode: 'HTML'
-            }).catch(() => {});
-          }
-
-          // ለቴሌግራም ስክሪን መልስ መስጠት
-          await axios.post(`https://api.telegram.org/bot${BOT_TOKEN}/answerCallbackQuery`, {
-            callback_query_id: callbackQueryId,
-            text: `✅ ${tier} VIP በተሳካ ሁኔታ ጸድቋል!`,
-            show_alert: true
-          }).catch(() => {});
-        }
-      }
-
-      // አድሚኑ Reject ሲል
-      else if (data.startsWith('rej_')) {
-        const orderId = data.replace('rej_', '');
-        const order = db.subscriptions.find(s => s.id === orderId);
-
-        if (order) {
-          order.status = 'Rejected';
-          saveDB(db);
-
-          const userMsg = `⚠️ <b>የክፍያ ማሳሰቢያ</b>\n\n` +
-            `የላኩት የክፍያ ማረጋገጫ (TxID: ${order.txId}) ውድቅ ተደርጓል።\n` +
-            `እባክዎ ትክክለኛውን ደረሰኝ ለድጋፍ ሰጪ ቡድናችን ይላኩ።`;
-
-          await axios.post(`https://api.telegram.org/bot${BOT_TOKEN}/sendMessage`, {
-            chat_id: order.userId,
-            text: userMsg,
-            parse_mode: 'HTML'
-          }).catch(() => {});
-
-          const updatedCaption = `❌ <b>ክፍያው ውድቅ ተደርጓል (REJECTED)!</b>\n\n` +
-            `👤 <b>ተጠቃሚ:</b> @${escapeTg(order.username)} (<code>${order.userId}</code>)\n` +
-            `💰 <b>መጠን:</b> ${order.amount} ETB\n` +
-            `🧾 <b>TxID:</b> <code>${order.txId}</code>`;
-
-          if (message.photo) {
-            await axios.post(`https://api.telegram.org/bot${BOT_TOKEN}/editMessageCaption`, {
-              chat_id: message.chat.id,
-              message_id: message.message_id,
-              caption: updatedCaption,
-              parse_mode: 'HTML'
-            }).catch(() => {});
-          } else {
-            await axios.post(`https://api.telegram.org/bot${BOT_TOKEN}/editMessageText`, {
-              chat_id: message.chat.id,
-              message_id: message.message_id,
-              text: updatedCaption,
-              parse_mode: 'HTML'
-            }).catch(() => {});
-          }
-
-          await axios.post(`https://api.telegram.org/bot${BOT_TOKEN}/answerCallbackQuery`, {
-            callback_query_id: callbackQueryId,
-            text: '❌ ክፍያው ውድቅ ተደርጓል!',
-            show_alert: true
-          }).catch(() => {});
-        }
-      }
+    if (query.message.photo) {
+      await bot.editMessageCaption(updatedCaption, {
+        chat_id: query.message.chat.id,
+        message_id: query.message.message_id,
+        parse_mode: 'HTML'
+      });
+    } else {
+      await bot.editMessageText(updatedCaption, {
+        chat_id: query.message.chat.id,
+        message_id: query.message.message_id,
+        parse_mode: 'HTML'
+      });
     }
 
-    res.sendStatus(200);
-  } catch (err) {
-    console.error('Webhook Error:', err);
-    res.sendStatus(200);
-  }
-});
+    // ለተጠቃሚው በቦቱ የግል ማሳወቂያ መላክ
+    try {
+      await bot.sendMessage(userId, 
+        `🎉 <b>እንኳን ደስ አለዎት!</b>\n` +
+        `የ <b>${tier} አባልነትዎ</b> በአድሚን ጸድቋል! አሁኑኑ አፑን ከፍተው በልዩ ጥቅማጥቅሞች ይደሰቱ!`, 
+        { parse_mode: 'HTML' }
+      );
+    } catch (e) {}
 
-// 🌐 3. Webhook በአንድ ክሊክ ማገናኛ (One-Click Webhook Setup)
-app.get('/setup-webhook', async (req, res) => {
-  try {
-    const fullUrl = `${req.protocol}://${req.get('host')}/api/telegram-webhook`;
-    const tgRes = await axios.get(`https://api.telegram.org/bot${BOT_TOKEN}/setWebhook?url=${encodeURIComponent(fullUrl)}`);
-    res.json({
-      status: 'success',
-      message: 'Telegram Webhook connected successfully!',
-      webhookUrl: fullUrl,
-      telegramResponse: tgRes.data
+    bot.answerCallbackQuery(query.id, { text: `✅ ${tier} በተሳካ ሁኔታ ጸድቋል!` });
+  }
+
+  // REJECT ሲጫን
+  else if (data.startsWith('v_rej:')) {
+    const [_, userId] = data.split(':');
+    liveStatusCache[userId] = { status: 'rejected' };
+
+    callSheet({
+      action: 'reject_vip',
+      userId: userId,
+      rejectedBy: adminTag
     });
-  } catch (err) {
-    res.status(500).json({ status: 'error', message: err.message });
-  }
-});
 
-// 📊 4. ዳሽቦርድ ትዕዛዞችን ሲያመጣ (GET SUBSCRIPTIONS)
-app.get('/api/subscriptions', (req, res) => {
-  const db = loadDB();
-  res.json({ status: 'success', subscriptions: db.subscriptions });
-});
+    const originalText = query.message.caption || query.message.text || '';
+    const updatedCaption = originalText + `\n\n❌ <b>በ ${adminTag} ውድቅ ተደርጓል (REJECTED)!</b>`;
 
-// 👑 5. ዳሽቦርድ ላይ ሆኖ Approve ሲደረግ
-app.post('/api/approve-vip', async (req, res) => {
-  try {
-    const { userId, txId, vipTier, adminKey } = req.body;
-
-    if (adminKey !== ADMIN_SECRET) {
-      return res.status(403).json({ status: 'error', message: 'Unauthorized Admin Key' });
+    if (query.message.photo) {
+      await bot.editMessageCaption(updatedCaption, {
+        chat_id: query.message.chat.id,
+        message_id: query.message.message_id,
+        parse_mode: 'HTML'
+      });
+    } else {
+      await bot.editMessageText(updatedCaption, {
+        chat_id: query.message.chat.id,
+        message_id: query.message.message_id,
+        parse_mode: 'HTML'
+      });
     }
 
-    const db = loadDB();
-    const order = db.subscriptions.find(s => String(s.userId) === String(userId) && (String(s.txId) === String(txId) || !txId));
+    try {
+      await bot.sendMessage(userId, `⚠️ <b>ማሳሰቢያ፦</b> ያስገቡት የክፍያ ደረሰኝ ትክክል ስላልሆነ በአድሚን ውድቅ ተደርጓል።`, { parse_mode: 'HTML' });
+    } catch (e) {}
 
-    if (!order) return res.status(404).json({ status: 'error', message: 'Order not found' });
-
-    const tierToSet = (vipTier || order.vipTier || 'PRO').toUpperCase();
-    const expiry = (tierToSet === 'REFERRAL_BOOSTER')
-      ? new Date(Date.now() + 3650 * 24 * 60 * 60 * 1000).toISOString()
-      : new Date(Date.now() + 30 * 24 * 60 * 60 * 1000).toISOString();
-
-    order.status = 'Approved';
-    order.expiryDate = expiry;
-    db.usersVip[userId] = { vipTier: tierToSet, vipExpiry: expiry, approvedAt: new Date().toISOString() };
-    saveDB(db);
-
-    const userMsg = `🎉 <b>እንኳን ደስ አለዎት!</b>\n\nየ <b>${tierToSet}</b> አገልግሎትዎ ጸድቋል!\n📅 የሚያበቃበት ቀን: ${new Date(expiry).toLocaleDateString()}`;
-    await axios.post(`https://api.telegram.org/bot${BOT_TOKEN}/sendMessage`, { chat_id: userId, text: userMsg, parse_mode: 'HTML' }).catch(() => {});
-
-    res.json({ status: 'success', message: 'VIP Approved', expiry });
-  } catch (err) {
-    res.status(500).json({ status: 'error', message: err.message });
+    bot.answerCallbackQuery(query.id, { text: `❌ ውድቅ ተደርጓል!` });
   }
 });
 
-// ❌ 6. ዳሽቦርድ ላይ ሆኖ Reject ሲደረግ
-app.post('/api/reject-vip', async (req, res) => {
-  try {
-    const { userId, txId, reason, adminKey } = req.body;
-
-    if (adminKey !== ADMIN_SECRET) {
-      return res.status(403).json({ status: 'error', message: 'Unauthorized Admin Key' });
-    }
-
-    const db = loadDB();
-    const order = db.subscriptions.find(s => String(s.userId) === String(userId) && (String(s.txId) === String(txId) || !txId));
-
-    if (!order) return res.status(404).json({ status: 'error', message: 'Order not found' });
-
-    order.status = 'Rejected';
-    saveDB(db);
-
-    const userMsg = `⚠️ <b>የክፍያ ማሳሰቢያ</b>\n\nየላኩት ክፍያ ውድቅ ተደርጓል።\n📌 ምክንያት: ${reason || 'ደረሰኝ አልተገኘም'}`;
-    await axios.post(`https://api.telegram.org/bot${BOT_TOKEN}/sendMessage`, { chat_id: userId, text: userMsg, parse_mode: 'HTML' }).catch(() => {});
-
-    res.json({ status: 'success', message: 'VIP Rejected' });
-  } catch (err) {
-    res.status(500).json({ status: 'error', message: err.message });
+// -------------------------------------------------------------
+// 3. አፑ በጀርባ እየጠየቀ የሚያጣራበት (Status Poller)
+// -------------------------------------------------------------
+app.get('/api/check-vip-status', (req, res) => {
+  const userId = req.query.userId;
+  const user = liveStatusCache[userId];
+  if (user) {
+    res.json(user);
+  } else {
+    res.json({ status: 'none' });
   }
 });
 
-// 🔍 7. ተጠቃሚው አፑን ሲከፍት VIP ደረጃውን ማረጋገጫ (CHECK VIP)
-app.get('/api/check-vip/:userId', (req, res) => {
-  const db = loadDB();
-  const vipData = db.usersVip[req.params.userId];
-  const pendingOrder = db.subscriptions.find(s => String(s.userId) === String(req.params.userId) && s.status === 'Pending');
+// -------------------------------------------------------------
+// 4. አድሚን ግሩፕ ውስጥ የሚሰራ /stats ወይም /dashboard Command
+// -------------------------------------------------------------
+bot.onText(/\/stats|\/dashboard/, async (msg) => {
+  if (String(msg.chat.id) !== String(ADMIN_GROUP_ID)) return;
 
-  if (vipData) {
-    if (new Date(vipData.vipExpiry) < new Date()) {
-      return res.json({ vipTier: 'None', isVip: false, isPending: false });
-    }
-    return res.json({ ...vipData, isVip: true, isPending: false });
+  const waitMsg = await bot.sendMessage(msg.chat.id, '⏳ ከ Google Sheet መረጃዎችን በማስላት ላይ...');
+  const stats = await callSheet({ action: 'get_stats' });
+
+  if (!stats || stats.status !== 'success') {
+    return bot.editMessageText('❌ መረጃዎችን ከ Sheet ማምጣት አልተቻለም።', {
+      chat_id: msg.chat.id,
+      message_id: waitMsg.message_id
+    });
   }
 
-  res.json({
-    vipTier: 'None',
-    isVip: false,
-    isPending: !!pendingOrder,
-    pendingOrder: pendingOrder || null
+  const report = 
+    `📊 <b>SWAP MONEY VIP FINANCIAL DASHBOARD</b>\n` +
+    `━━━━━━━━━━━━━━━━━━━━\n` +
+    `💰 <b>ጠቅላላ የጸደቀ ገቢ፦</b> <b>${stats.totalRevenue.toLocaleString()} ETB</b>\n` +
+    `📱 <b>በ Telebirr የገባ፦</b> ${stats.telebirrTotal.toLocaleString()} ETB\n` +
+    `🏦 <b>በ CBE Bank የገባ፦</b> ${stats.cbeTotal.toLocaleString()} ETB\n` +
+    `━━━━━━━━━━━━━━━━━━━━\n` +
+    `👑 <b>ንቁ VIP አባላት፦</b> ${stats.activeVips} ሰዎች\n` +
+    `⏳ <b>በጥበቃ ላይ ያሉ፦</b> ${stats.pendingCount} ጥያቄዎች\n` +
+    `❌ <b>ውድቅ የተደረጉ፦</b> ${stats.rejectedCount} ጥያቄዎች\n` +
+    `━━━━━━━━━━━━━━━━━━━━\n` +
+    `⚡ <i>መረጃው በቀጥታ ከኦፊሴላዊው Google Sheet የተወሰደ ነው።</i>`;
+
+  bot.editMessageText(report, {
+    chat_id: msg.chat.id,
+    message_id: waitMsg.message_id,
+    parse_mode: 'HTML'
   });
 });
 
-app.listen(PORT, () => {
-  console.log(`Swap VIP Server listening on port ${PORT}`);
-});
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, () => console.log(`🚀 VIP Server live on port ${PORT}`));
